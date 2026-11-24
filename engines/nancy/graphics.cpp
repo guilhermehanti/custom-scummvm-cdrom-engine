@@ -1,0 +1,1125 @@
+/* ScummVM - Graphic Adventure Engine
+ *
+ * ScummVM is the legal property of its developers, whose names
+ * are too numerous to list here. Please refer to the COPYRIGHT
+ * file distributed with this source distribution.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include "image/bmp.h"
+
+#include "engines/util.h"
+
+#include "engines/nancy/nancy.h"
+#include "engines/nancy/graphics.h"
+#include "engines/nancy/resource/iff.h"
+#include "engines/nancy/renderobject.h"
+#include "engines/nancy/resource/resource.h"
+#include "engines/nancy/cursor.h"
+#include "engines/nancy/state/scene.h"
+
+namespace Nancy {
+
+// The ARGB colors in the game data are 32-bit ARGB pixels
+const Graphics::PixelFormat kARGBFormat(4, 8, 8, 8, 8, 16, 8, 0, 24);
+
+uint32 argbToColor(const Graphics::PixelFormat &format, uint32 argb) {
+	byte a, r, g, b;
+	kARGBFormat.colorToARGB(argb, a, r, g, b);
+	return format.ARGBToColor(a, r, g, b);
+}
+
+void blendPixel(Graphics::ManagedSurface &surface, int x, int y, byte a, byte r, byte g, byte b) {
+	if (x < 0 || y < 0 || x >= surface.w || y >= surface.h) {
+		return;
+	}
+
+	byte destA, destR, destG, destB;
+	surface.format.colorToARGB(surface.getPixel(x, y), destA, destR, destG, destB);
+
+	uint destWeight = destA * (255 - a) / 255;
+	uint outA = a + destWeight;
+	if (outA == 0) {
+		return;
+	}
+
+	surface.setPixel(x, y, surface.format.ARGBToColor(outA,
+		(r * a + destR * destWeight) / outA,
+		(g * a + destG * destWeight) / outA,
+		(b * a + destB * destWeight) / outA));
+}
+
+byte colorChannelToByte(float channel) {
+	return (byte)(CLIP(channel, 0.0f, 1.0f) * 255 + 0.5f);
+}
+
+void argbToChannels(uint32 argb, float *channels) {
+	byte a, r, g, b;
+	kARGBFormat.colorToARGB(argb, a, r, g, b);
+	channels[0] = a / 255.0f;
+	channels[1] = r / 255.0f;
+	channels[2] = g / 255.0f;
+	channels[3] = b / 255.0f;
+}
+
+uint32 channelsToArgb(const float *channels) {
+	return kARGBFormat.ARGBToColor(colorChannelToByte(channels[0]), colorChannelToByte(channels[1]),
+		colorChannelToByte(channels[2]), colorChannelToByte(channels[3]));
+}
+
+float getBlendAmount(float seconds, float rate) {
+	return 1.0f - powf(rate, 30.0f * seconds);
+}
+
+bool blendColor(float *current, uint32 target, float amount) {
+	float targetChannels[4];
+	argbToChannels(target, targetChannels);
+
+	bool changed = false;
+	for (uint i = 0; i < 4; ++i) {
+		byte before = colorChannelToByte(current[i]);
+		current[i] += (targetChannels[i] - current[i]) * amount;
+		changed |= colorChannelToByte(current[i]) != before;
+	}
+
+	return changed;
+}
+
+GraphicsManager::GraphicsManager() :
+	_objects(objectComparator),
+	_inputPixelFormat16(2, 5, 5, 5, 0, 10, 5, 0, 0),
+	_inputPixelFormat24(Graphics::PixelFormat::createFormatBGR24()),
+	_inputPixelFormat32(Graphics::PixelFormat::createFormatBGRA32()),
+	_screenPixelFormat16(2, 5, 6, 5, 0, 11, 5, 0, 0),
+	_screenPixelFormat32(Graphics::PixelFormat::createFormatBGRA32()),
+	_clut8Format(Graphics::PixelFormat::createFormatCLUT8()),
+	_transparentPixelFormat(Graphics::PixelFormat::createFormatBGRA32()),
+	_screen(getScreenBounds().width(), getScreenBounds().height(), getScreenPixelFormat()),
+	_isSuppressed(false){}
+void GraphicsManager::init() {
+	auto *bsum = GetEngineData(BSUM);
+	assert(bsum);
+
+	// Extract transparent color from the boot summary
+	if (g_nancy->getGameType() == kGameTypeVampire) {
+		_transColor = bsum->paletteTrans;
+	} else {
+		const Graphics::PixelFormat &format = getInputPixelFormat();
+		_transColor = (bsum->rTrans << format.rShift) |
+					  (bsum->gTrans << format.gShift) |
+					  (bsum->bTrans << format.bShift);
+	}
+
+	initGraphics(_screen.w, _screen.h, &getScreenPixelFormat());
+	_screen.setTransparentColor(getTransColor());
+	_screen.clear();
+
+	// Nancy16 runs at a higher resolution than the game was made for. The
+	// viewport's chunk holds the resolution the game gets drawn at, which is
+	// the one of the screen from Nancy24 on.
+	const VIEW *viewportData = GetEngineData(VIEW);
+	if (g_nancy->getGameType() >= kGameTypeNancy16 && viewportData &&
+			(viewportData->bounds.width() != _screen.w || viewportData->bounds.height() != _screen.h)) {
+		_gameSurface.create(viewportData->bounds.width(), viewportData->bounds.height(), getScreenPixelFormat());
+		_gameSurface.setTransparentColor(getTransColor());
+		_gameSurface.clear();
+	}
+
+	// OB0 has been dropped in Nancy16+
+	const ImageChunk *ob0 = (const ImageChunk *)g_nancy->getEngineData("OB0");
+	if (ob0)
+		g_nancy->_resource->loadImage(ob0->imageName, _object0);
+}
+
+void GraphicsManager::draw(bool updateScreen) {
+	if (_isSuppressed && updateScreen) {
+		_isSuppressed = false;
+		return;
+	}
+
+	g_nancy->_cursor->applyCursor();
+
+	// Update graphics for all RenderObjects and determine
+	// the areas of the screen that need to be redrawn
+	bool isZoomed = false;
+	for (auto it : _objects) {
+		RenderObject &current = *it;
+
+		current.updateGraphics();
+		isZoomed |= current.isVisible() && current.isZoomed();
+
+		if (current.needsRedraw()) {
+			const Common::Rect &drawnPosition = current.getDrawnScreenPosition();
+			if (current.isVisible()) {
+				if (!drawnPosition.isEmpty() && drawnPosition != current.getScreenPosition()) {
+					// Object moved to a new location on screen, update the previous one
+					addDirtyRect(current, drawnPosition);
+				}
+
+				// Redraw the current location
+				addDirtyRect(current, current.getScreenPosition());
+			} else if (!drawnPosition.isEmpty()) {
+				// Object just turned invisible, redraw the last location. An object
+				// that stays invisible has nothing to clean up, however often it changes.
+				addDirtyRect(current, drawnPosition);
+			}
+		}
+
+		current.setDrawnScreenPosition(current.isVisible() ? current.getScreenPosition() : Common::Rect());
+		current.setNeedsRedraw(false);
+		current.setHasMoved(false);
+		current.updatePreviousScreenPosition();
+	}
+
+	// While anything is zoomed into, and once it stops being, all of the
+	// viewport gets drawn anew
+	if (isZoomed || _wasZoomed) {
+		_dirtyRects.push_back(NancySceneState.getViewport().getScreenPosition());
+	}
+
+	_wasZoomed = isZoomed;
+
+	filterDirtyRects(_dirtyRects);
+
+	if (!isGameScaled()) {
+		drawObjects(_screen, _dirtyRects, kLayerAll);
+	} else {
+		// The game gets drawn at its own resolution, and the changed parts get scaled
+		// onto the screen, where the objects at the screen's resolution go over them
+		drawObjects(_gameSurface, _dirtyRects, kLayerGame);
+
+		for (const Common::Rect &rect : _dirtyRects) {
+			// Filtering blends each screen pixel with its game pixel's neighbors
+			Common::Rect screenRect = gameToScreen(rect);
+			screenRect.grow(2);
+			screenRect.clip(Common::Rect(_screen.w, _screen.h));
+			_nativeDirtyRects.push_back(screenRect);
+		}
+
+		filterDirtyRects(_nativeDirtyRects);
+
+		for (const Common::Rect &rect : _nativeDirtyRects) {
+			blitGameToScreen(rect);
+		}
+
+		drawObjects(_screen, _nativeDirtyRects, kLayerNative);
+	}
+
+	// Draw the screen
+	if (updateScreen) {
+		_screen.update();
+	}
+
+	// Remove all dirty rects for the next frame
+	_dirtyRects.clear();
+	_nativeDirtyRects.clear();
+}
+
+void GraphicsManager::addDirtyRect(const RenderObject &object, const Common::Rect &rect) {
+	if (isGameScaled() && object.isNativeResolution()) {
+		_nativeDirtyRects.push_back(rect);
+	} else {
+		_dirtyRects.push_back(rect);
+	}
+}
+
+bool GraphicsManager::isInLayer(const RenderObject &object, Layer layer) const {
+	return layer == kLayerAll || object.isNativeResolution() == (layer == kLayerNative);
+}
+
+// Filter out dirty rects that are completely inside others to reduce overdraw
+void GraphicsManager::filterDirtyRects(Common::List<Common::Rect> &rects) {
+	// Rects that overlap are merged into one. An area that gets drawn twice would
+	// have the objects with an alpha channel blended onto it twice.
+	bool hasMerged;
+	do {
+		hasMerged = false;
+
+		for (auto outer = rects.begin(); outer != rects.end() && !hasMerged; ++outer) {
+			for (auto inner = rects.begin(); inner != rects.end(); ++inner) {
+				if (inner != outer && outer->intersects(*inner)) {
+					outer->extend(*inner);
+					rects.erase(inner);
+					hasMerged = true;
+					break;
+				}
+			}
+		}
+	} while (hasMerged);
+}
+
+// Perform the actual drawing. This checks for cases where something would be fully obscured,
+// and skips them (e.g. redrawing the Viewport won't also redraw the background)
+void GraphicsManager::drawObjects(Graphics::ManagedSurface &target, const Common::List<Common::Rect> &rects, Layer layer) {
+	if (rects.empty()) {
+		return;
+	}
+
+	// What gets drawn and where, worked out once for all of the rects
+	struct DrawnObject {
+		const RenderObject *object;
+		Common::Rect position;
+		bool isOpaque;
+	};
+
+	Common::Array<DrawnObject> drawn;
+	for (const RenderObject *object : _objects) {
+		if (!isInLayer(*object, layer) || !object->isVisible()) {
+			continue;
+		}
+
+		DrawnObject entry;
+		entry.object = object;
+		entry.position = getDrawnPosition(*object);
+		if (!object->getClipRect().isEmpty()) {
+			entry.position.clip(object->getClipRect());
+		}
+
+		// What a stencil leaves out of a masked object shows what is behind it
+		entry.isOpaque = !object->_drawSurface.hasTransparentColor() && object->_drawSurface.format != _transparentPixelFormat &&
+			!object->isStencil() && !object->isMasked();
+		if (!entry.position.isEmpty()) {
+			drawn.push_back(entry);
+		}
+	}
+
+	for (const Common::Rect &rect : rects) {
+		for (uint i = 0; i < drawn.size(); ++i) {
+			const Common::Rect intersection = rect.findIntersectingRect(drawn[i].position);
+			if (intersection.isEmpty() || drawn[i].object->isStencil()) {
+				continue;
+			}
+
+			// An opaque object that comes later and covers all of the area hides it
+			bool isHidden = false;
+			for (uint j = i + 1; j < drawn.size(); ++j) {
+				if (drawn[j].isOpaque && intersection.findIntersectingRect(drawn[j].position) == intersection) {
+					isHidden = true;
+					break;
+				}
+			}
+
+			if (isHidden) {
+				continue;
+			}
+
+			// Only the stencils drawn before a masked object cut into it
+			Common::Array<const RenderObject *> stencils;
+			for (uint j = 0; j < i && drawn[i].object->isMasked(); ++j) {
+				if (drawn[j].object->isStencil() && !intersection.findIntersectingRect(drawn[j].position).isEmpty()) {
+					stencils.push_back(drawn[j].object);
+				}
+			}
+
+			if (stencils.empty()) {
+				blitObject(target, *drawn[i].object, intersection);
+			} else {
+				blitMaskedObject(target, *drawn[i].object, stencils, intersection);
+			}
+		}
+	}
+}
+
+// The game pixel a screen pixel's center falls on, in 1/256ths of a pixel, as texture
+// sampling puts it; the fraction is how much of the next game pixel gets blended in
+static int getBilinearPosition(int screenPos, int screenSize, int gameSize) {
+	int pos = (2 * screenPos + 1) * gameSize * 128 / screenSize - 128;
+	return CLIP<int>(pos, 0, (gameSize - 1) * 256);
+}
+
+// The game gets scaled onto the screen with bilinear filtering, like the original's
+// Direct3D texture sampling does
+void GraphicsManager::blitGameToScreen(Common::Rect screenRect) {
+	screenRect.clip(Common::Rect(_screen.w, _screen.h));
+	if (screenRect.isEmpty()) {
+		return;
+	}
+
+	assert(_screen.format.bytesPerPixel == 4 && _gameSurface.format == _screen.format);
+
+	// Where each column samples the game, and how much of the next game pixel it takes
+	Common::Array<int> srcColumns(screenRect.width());
+	Common::Array<int> columnWeights(screenRect.width());
+	for (int x = screenRect.left; x < screenRect.right; ++x) {
+		int pos = getBilinearPosition(x, _screen.w, _gameSurface.w);
+		srcColumns[x - screenRect.left] = pos >> 8;
+		columnWeights[x - screenRect.left] = pos & 0xFF;
+	}
+
+	for (int y = screenRect.top; y < screenRect.bottom; ++y) {
+		int pos = getBilinearPosition(y, _screen.h, _gameSurface.h);
+		int srcY = pos >> 8;
+		int rowWeight = pos & 0xFF;
+
+		const byte *row0 = (const byte *)_gameSurface.getBasePtr(0, srcY);
+		const byte *row1 = (const byte *)_gameSurface.getBasePtr(0, MIN<int>(srcY + 1, _gameSurface.h - 1));
+		byte *dest = (byte *)_screen.getBasePtr(screenRect.left, y);
+
+		for (int i = 0; i < screenRect.width(); ++i) {
+			int x0 = srcColumns[i] * 4;
+			int x1 = MIN<int>(srcColumns[i] + 1, _gameSurface.w - 1) * 4;
+			int colWeight = columnWeights[i];
+
+			for (int channel = 0; channel < 4; ++channel) {
+				int top = row0[x0 + channel] * (256 - colWeight) + row0[x1 + channel] * colWeight;
+				int bottom = row1[x0 + channel] * (256 - colWeight) + row1[x1 + channel] * colWeight;
+				*dest++ = (top * (256 - rowWeight) + bottom * rowWeight + (1 << 15)) >> 16;
+			}
+		}
+	}
+
+	_screen.addDirtyRect(screenRect);
+}
+
+Common::Rect GraphicsManager::getGameBounds() const {
+	return isGameScaled() ? Common::Rect(_gameSurface.w, _gameSurface.h) : Common::Rect(_screen.w, _screen.h);
+}
+
+Common::Point GraphicsManager::screenToGame(const Common::Point &pos) const {
+	if (!isGameScaled()) {
+		return pos;
+	}
+
+	return Common::Point(pos.x * _gameSurface.w / _screen.w, pos.y * _gameSurface.h / _screen.h);
+}
+
+Common::Point GraphicsManager::gameToScreen(const Common::Point &pos) const {
+	if (!isGameScaled()) {
+		return pos;
+	}
+
+	return Common::Point(pos.x * _screen.w / _gameSurface.w, pos.y * _screen.h / _gameSurface.h);
+}
+
+// The screen area covering every pixel the game rect gets scaled onto
+Common::Rect GraphicsManager::gameToScreen(const Common::Rect &rect) const {
+	if (!isGameScaled()) {
+		return rect;
+	}
+
+	return Common::Rect(rect.left * _screen.w / _gameSurface.w,
+		rect.top * _screen.h / _gameSurface.h,
+		(rect.right * _screen.w + _gameSurface.w - 1) / _gameSurface.w,
+		(rect.bottom * _screen.h + _gameSurface.h - 1) / _gameSurface.h);
+}
+
+void GraphicsManager::loadFonts(Common::SeekableReadStream *chunkStream) {
+	auto *bsum = GetEngineData(BSUM);
+	assert(bsum);
+	assert(chunkStream);
+
+	chunkStream->seek(0);
+	_fonts.resize(bsum->numFonts);
+	for (uint i = 0; i < _fonts.size(); ++i) {
+		_fonts[i].read(*chunkStream);
+	}
+
+	delete chunkStream;
+}
+
+// Fonts get placed at their IDs, which font tags in text refer to. The bold versions
+// follow them, and can only be found by name.
+void GraphicsManager::loadSystemFonts(const IFF &fontIFF) {
+	Common::SeekableReadStream *chunkStream = nullptr;
+	for (uint i = 0; (chunkStream = fontIFF.getChunkStream("FONT", i)); ++i) {
+		uint32 id = chunkStream->readUint32LE();
+		if (id >= _fonts.size()) {
+			_fonts.resize(id + 1);
+		}
+
+		_fonts[id].readSystemFont(*chunkStream, false);
+		delete chunkStream;
+	}
+
+	for (uint i = 0; (chunkStream = fontIFF.getChunkStream("FONT", i)); ++i) {
+		chunkStream->skip(4);
+		_fonts.resize(_fonts.size() + 1);
+		_fonts.back().readSystemFont(*chunkStream, true);
+		delete chunkStream;
+	}
+
+	for (uint i = 0; (chunkStream = fontIFF.getChunkStream("COLR", i)); ++i) {
+		uint32 id = chunkStream->readUint32LE();
+		if (id >= _fontColors.size()) {
+			_fontColors.resize(id + 1);
+		}
+
+		// ARGB colors for the normal, disabled, mouse over and pressed states. The
+		// focused state looks normal, and the hidden one is transparent.
+		FontColor &color = _fontColors[id];
+		color.colors[kFontColorNormal] = chunkStream->readUint32BE();
+		color.colors[kFontColorFocus] = color.colors[kFontColorNormal];
+		color.colors[kFontColorDisabled] = chunkStream->readUint32BE();
+		color.colors[kFontColorMouseOver] = chunkStream->readUint32BE();
+		color.colors[kFontColorPressed] = chunkStream->readUint32BE();
+		delete chunkStream;
+	}
+}
+
+// The font file of the game folder a face is in, if any. The face in the one
+// file Nancy23 has, "Digital Display2.ttf", is named after the file.
+static Common::Path findCustomFontFile(const ScriptBootData &boot, const Common::String &faceName) {
+	for (const Common::String &fileName : boot.customFontFiles) {
+		Common::String baseName = fileName;
+		const size_t dot = baseName.findLastOf('.');
+		if (dot != Common::String::npos) {
+			baseName.erase(dot);
+		}
+
+		if (baseName.equalsIgnoreCase(faceName)) {
+			return Common::Path(fileName);
+		}
+	}
+
+	return Common::Path();
+}
+
+void GraphicsManager::loadSystemFonts(const ScriptBootData &boot) {
+	const int32 kNormalWeight = 400;
+	const int32 kBoldWeight = 700;
+
+	for (const ScriptBootData::SystemFont &font : boot.fonts) {
+		if (font.id < 0) {
+			continue;
+		}
+
+		if ((uint)font.id >= _fonts.size()) {
+			_fonts.resize(font.id + 1);
+		}
+
+		_fonts[font.id].setSystemFont(font.name, font.faceName, font.height, font.isBold ? kBoldWeight : kNormalWeight,
+			findCustomFontFile(boot, font.faceName));
+	}
+
+	// Every font also comes in bold, after the ones with a number of their own
+	for (const ScriptBootData::SystemFont &font : boot.fonts) {
+		_fonts.resize(_fonts.size() + 1);
+		_fonts.back().setSystemFont(font.name + "_Bold", font.faceName, font.height, kBoldWeight,
+			findCustomFontFile(boot, font.faceName));
+	}
+
+	for (const ScriptBootData::FontColor &color : boot.fontColors) {
+		if (color.id < 0) {
+			continue;
+		}
+
+		if ((uint)color.id >= _fontColors.size()) {
+			_fontColors.resize(color.id + 1);
+		}
+
+		FontColor &fontColor = _fontColors[color.id];
+		fontColor.colors[kFontColorNormal] = color.normal;
+		fontColor.colors[kFontColorFocus] = color.normal;
+		fontColor.colors[kFontColorDisabled] = color.disabled;
+		fontColor.colors[kFontColorMouseOver] = color.mouseOver;
+		fontColor.colors[kFontColorPressed] = color.pressed;
+	}
+}
+
+const Font *GraphicsManager::getFont(const Common::String &name) const {
+	int id = getFontID(name);
+	return id >= 0 ? &_fonts[id] : nullptr;
+}
+
+int GraphicsManager::getFontID(const Common::String &name) const {
+	for (uint i = 0; i < _fonts.size(); ++i) {
+		if (_fonts[i].getName().equalsIgnoreCase(name)) {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+uint32 GraphicsManager::getFontColor(uint id, const Graphics::PixelFormat &format, FontColorState state) const {
+	return argbToColor(format, id < _fontColors.size() ? _fontColors[id].colors[state] : 0xFFFFFFFF);
+}
+
+void GraphicsManager::addObject(RenderObject *object) {
+	for (auto &r : _objects) {
+		if (r == object) {
+			// Erase and re-add objects already in the array to make sure
+			// any changes in the z depth are reflected correctly
+			_objects.erase(&r);
+		}
+	}
+
+	_objects.insert(object);
+}
+
+void GraphicsManager::reorderObject(RenderObject *object) {
+	// The array is kept sorted as objects are inserted, so an object that has
+	// changed its z depth has to be taken out and put back to move. One that is
+	// not in the list yet has nothing to reorder; it will be sorted when it is
+	// added.
+	for (auto &r : _objects) {
+		if (r == object) {
+			_objects.erase(&r);
+			_objects.insert(object);
+			return;
+		}
+	}
+}
+
+void GraphicsManager::removeObject(RenderObject *object) {
+	for (auto &r : _objects) {
+		if (r == object) {
+			// Make sure the object gets properly cleared, where it was drawn
+			if (!r->getDrawnScreenPosition().isEmpty()) {
+				addDirtyRect(*r, r->getDrawnScreenPosition());
+			}
+
+			_objects.erase(&r);
+			break;
+		}
+	}
+}
+
+bool GraphicsManager::hasObject(const RenderObject *object) const {
+	for (const RenderObject *r : _objects) {
+		if (r == object) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void GraphicsManager::clearObjects() {
+	_objects.clear();
+}
+
+void GraphicsManager::redrawAll() {
+	for (auto &obj : _objects) {
+		obj->setNeedsRedraw(true);
+	}
+}
+
+void GraphicsManager::suppressNextDraw() {
+	_isSuppressed = true;
+}
+
+void GraphicsManager::loadSurfacePalette(Graphics::ManagedSurface &inSurf, const Common::Path &paletteFilename, uint paletteStart, uint paletteSize) {
+	Common::File f;
+	if (f.open(paletteFilename.append(".bmp"))) {
+		Image::BitmapDecoder dec;
+		if (dec.loadStream(f)) {
+			inSurf.setPalette(dec.getPalette().data(), paletteStart, paletteSize);
+		}
+	}
+}
+
+void GraphicsManager::copyToManaged(const Graphics::Surface &src, Graphics::ManagedSurface &dst, bool verticalFlip, bool doubleSize) {
+	if (dst.w != (doubleSize ? src.w * 2 : src.w) || dst.h != (doubleSize ? src.h * 2 : src.h) || dst.format != src.format) {
+		uint8 palette[256 * 3];
+		bool hasPalette = dst.hasPalette();
+		bool hasTransColor = dst.hasTransparentColor();
+
+		if (hasPalette && g_nancy->getGameType() == kGameTypeVampire) {
+			dst.grabPalette(palette, 0, 256);
+		}
+
+		dst.create(doubleSize ? src.w * 2 : src.w, doubleSize ? src.h * 2 : src.h, src.format);
+
+		if (hasPalette && g_nancy->getGameType() == kGameTypeVampire) {
+			dst.setPalette(palette, 0, 256);
+		}
+
+		if (hasTransColor) {
+			// Do the same trick with the transparent color
+			dst.setTransparentColor(dst.getTransparentColor());
+		}
+	}
+
+	if (!verticalFlip && !doubleSize) {
+		dst.copyRectToSurface(src, 0, 0, Common::Rect(0, 0, src.w, src.h));
+		return;
+	}
+
+	for (int y = 0; y < src.h; ++y) {
+		if (!doubleSize) {
+			// Copy single line bottom to top
+			memcpy(dst.getBasePtr(0, y), src.getBasePtr(0, src.h - y - 1), src.w * src.format.bytesPerPixel);
+		} else {
+			// Make four copies of each source pixel
+			for (int x = 0; x < src.w; ++x) {
+				switch (src.format.bytesPerPixel) {
+				case 1: {
+					const byte *srcP = (const byte *)src.getBasePtr(x, y);
+					uint dstX = x * 2;
+					uint dstY = verticalFlip ? (src.h - y - 1) * 2 : src.h - y - 1;
+					byte *dstP = ((byte *)dst.getBasePtr(dstX, dstY));
+					*dstP = *srcP;
+					*(dstP + 1) = *srcP;
+					dstP += dst.w;
+					*dstP = *srcP;
+					*(dstP + 1) = *srcP;
+					break;
+				}
+				case 2: {
+					const uint16 *srcP = (const uint16 *)src.getBasePtr(x, y);
+					uint dstX = x * 2;
+					uint dstY = verticalFlip ? (src.h - y - 1) * 2 : src.h - y - 1;
+					uint16 *dstP = ((uint16 *)dst.getBasePtr(dstX, dstY));
+					*dstP = *srcP;
+					*(dstP + 1) = *srcP;
+					dstP += dst.w;
+					*dstP = *srcP;
+					*(dstP + 1) = *srcP;
+					break;
+				}
+				case 4: {
+					const uint32 *srcP = (const uint32 *)src.getBasePtr(x, y);
+					uint dstX = x * 2;
+					uint dstY = verticalFlip ? (src.h - y - 1) * 2 : src.h - y - 1;
+					uint32 *dstP = ((uint32 *)dst.getBasePtr(dstX, dstY));
+					*dstP = *srcP;
+					*(dstP + 1) = *srcP;
+					dstP += dst.w;
+					*dstP = *srcP;
+					*(dstP + 1) = *srcP;
+					break;
+				}
+				default:
+					return;
+				}
+			}
+		}
+	}
+}
+
+void GraphicsManager::copyToManaged(void *src, Graphics::ManagedSurface &dst, uint srcW, uint srcH, const Graphics::PixelFormat &format, bool verticalFlip, bool doubleSize) {
+	// Do things the lazy way and simply create a Surface and pass it to the other overload
+	// We do NOT free the surface since it's a temporary object and does not own the pixels
+	Graphics::Surface surf;
+	surf.w = srcW;
+	surf.h = srcH;
+	surf.format = format;
+	surf.pitch = srcW * format.bytesPerPixel;
+	surf.setPixels(src);
+
+	copyToManaged(surf, dst, verticalFlip, doubleSize);
+}
+
+// Custom rotation code since Surface::rotoscale() produces incorrect results
+// Only works on 16 bit surfaces and ignores transparency
+// Rotation is a value between 0 and 3, corresponding to 0, 90, 180, or 270 degrees clockwise
+void GraphicsManager::rotateBlit(const Graphics::ManagedSurface &src, Graphics::ManagedSurface &dest, byte rotation) {
+	assert(!src.empty() && !dest.empty());
+	assert(rotation <= 3);
+	assert(src.format.bytesPerPixel == dest.format.bytesPerPixel);
+
+	const uint srcW = src.w;
+	const uint srcH = src.h;
+	const uint bpp = src.format.bytesPerPixel;
+
+	if (rotation % 2) {
+		if (src.h != dest.w || src.w != dest.h) {
+			// Dest surface is wrong size, destroy it and create an appropriate one
+			dest.create(src.h, src.w, src.format);
+		}
+	} else {
+		if (src.w != dest.w || src.h != dest.h) {
+			// Dest surface is wrong size, destroy it and create an appropriate one
+			dest.create(src.w, src.h, src.format);
+		}
+	}
+
+	if (rotation == 0) {
+		// No rotation, just blit
+		dest.rawBlitFrom(src, src.getBounds(), Common::Point());
+		return;
+	}
+
+	for (uint y = 0; y < srcH; ++y) {
+		const byte *s = (const byte *)src.getBasePtr(0, y);
+		for (uint x = 0; x < srcW; ++x, s += bpp) {
+			byte *d;
+			switch (rotation) {
+			case 1:
+				// 90 degrees
+				d = (byte *)dest.getBasePtr(srcH - y - 1, x);
+				break;
+			case 2:
+				// 180 degrees
+				d = (byte *)dest.getBasePtr(srcW - x - 1, srcH - y - 1);
+				break;
+			default:
+				// 270 degrees
+				d = (byte *)dest.getBasePtr(y, srcW - x - 1);
+				break;
+			}
+
+			memcpy(d, s, bpp);
+		}
+	}
+}
+
+void GraphicsManager::crossDissolve(const Graphics::ManagedSurface &from, const Graphics::ManagedSurface &to, byte alpha, const Common::Rect &rect, Graphics::ManagedSurface &inResult) {
+	assert(from.getBounds() == to.getBounds());
+	inResult.blitFrom(from, rect, Common::Point());
+	inResult.transBlitFrom(to, rect, Common::Point(), (uint32)-1, false, alpha);
+}
+
+void GraphicsManager::debugDrawToScreen(const Graphics::ManagedSurface &surf) {
+	_screen.blitFrom(surf, Common::Point());
+	_screen.update();
+}
+
+const Graphics::PixelFormat &GraphicsManager::getInputPixelFormat(uint bpp) {
+	if (g_nancy->getGameType() == kGameTypeVampire)
+		return _clut8Format;
+
+	switch (bpp) {
+	case 0:
+		return g_nancy->getGameType() >= kGameTypeNancy13 ? _inputPixelFormat32 : _inputPixelFormat16;
+	case 16:
+		return _inputPixelFormat16;	// RGB555
+	case 24:
+		return _inputPixelFormat24;
+	case 32:
+		return _inputPixelFormat32;
+	default:
+		error("Unsupported input pixel format with bpp %d", bpp);
+	}
+}
+
+Common::Rect GraphicsManager::getScreenBounds() {
+	if (g_nancy->getGameType() >= kGameTypeNancy26) {
+		return Common::Rect(1024, 768);
+	}
+
+	return (g_nancy->getGameType() >= kGameTypeNancy16) ? Common::Rect(800, 600) : Common::Rect(640, 480);
+}
+
+const Graphics::PixelFormat &GraphicsManager::getScreenPixelFormat() {
+	return (g_nancy->getGameType() >= kGameTypeNancy13) ? _screenPixelFormat32 : _screenPixelFormat16;
+}
+
+const Graphics::PixelFormat &GraphicsManager::getTransparentPixelFormat() {
+	return _transparentPixelFormat;
+}
+
+void GraphicsManager::grabViewportObjects(Common::Array<RenderObject *> &inArray) {
+	// Add the viewport
+	inArray.push_back(&(RenderObject &)NancySceneState.getViewport());
+
+	// Add all viewport-relative (non-UI) objects
+	for (RenderObject *obj : _objects) {
+		if (obj->isViewportRelative()) {
+			inArray.push_back(obj);
+		}
+	}
+}
+
+void GraphicsManager::screenshotScreen(Graphics::ManagedSurface &inSurf) {
+	draw(false);
+	inSurf.free();
+	inSurf.copyFrom(_screen);
+}
+
+void GraphicsManager::getDrawnGameImage(Graphics::ManagedSurface &out) {
+	const Graphics::ManagedSurface &image = getGameImage();
+	if (_scriptDrawingZOrder < 0) {
+		out.copyFrom(image);
+		return;
+	}
+
+	// The objects below the script have been brought up to date for this frame
+	out.create(image.w, image.h, image.format);
+	out.clear(out.format.ARGBToColor(255, 0, 0, 0));
+	for (const RenderObject *object : _objects) {
+		if (object->getZOrder() >= _scriptDrawingZOrder) {
+			break;
+		}
+
+		if (!object->isVisible() || !isInLayer(*object, isGameScaled() ? kLayerGame : kLayerAll)) {
+			continue;
+		}
+
+		Common::Rect position = getDrawnPosition(*object);
+		if (!object->getClipRect().isEmpty()) {
+			position.clip(object->getClipRect());
+		}
+
+		position.clip(Common::Rect(out.w, out.h));
+		if (!position.isEmpty()) {
+			blitObject(out, *object, position);
+		}
+	}
+}
+
+bool GraphicsManager::takeSavePicture(Graphics::ManagedSurface &out) {
+	if (_savePicture.empty()) {
+		return false;
+	}
+
+	out.copyFrom(_savePicture);
+	_savePicture.free();
+	return true;
+}
+
+// Whether the pixels of a format are 32 bits, with 8 for each channel and for
+// the alpha, if there is one
+static bool hasByteChannels(const Graphics::PixelFormat &format) {
+	return format.bytesPerPixel == 4 && format.rBits() == 8 && format.gBits() == 8 && format.bBits() == 8 &&
+		(format.aBits() == 8 || format.aBits() == 0);
+}
+
+// Blends a 32 bit picture with an alpha channel onto a 32 bit target, giving
+// the same pixels as ManagedSurface::blitFrom. That one turns every pixel into
+// its components and back, which made the canvases of Nancy32's snow, as large
+// as the viewport and nearly all transparent, slow to draw; this one skips the
+// transparent pixels at once.
+static bool blitAlpha32(Graphics::ManagedSurface &target, const Graphics::ManagedSurface &src, const Common::Rect &source, const Common::Rect &dest) {
+	const Graphics::PixelFormat &srcFormat = src.format;
+	const Graphics::PixelFormat &destFormat = target.format;
+	if (!hasByteChannels(srcFormat) || srcFormat.aBits() != 8 || !hasByteChannels(destFormat) ||
+			source.width() != dest.width() || source.height() != dest.height() || src.hasTransparentColor()) {
+		return false;
+	}
+
+	Common::Rect clipped = dest.findIntersectingRect(Common::Rect(target.w, target.h));
+	if (clipped.isEmpty()) {
+		return true;
+	}
+
+	const int offsetX = source.left - dest.left;
+	const int offsetY = source.top - dest.top;
+	const bool isSameFormat = srcFormat == destFormat;
+	const bool hasDestAlpha = destFormat.aBits() == 8;
+
+	for (int y = clipped.top; y < clipped.bottom; ++y) {
+		const uint32 *srcRow = (const uint32 *)src.getBasePtr(clipped.left + offsetX, y + offsetY);
+		uint32 *destRow = (uint32 *)target.getBasePtr(clipped.left, y);
+
+		for (int x = 0; x < clipped.width(); ++x) {
+			const uint32 color = srcRow[x];
+			const uint32 alpha = (color >> srcFormat.aShift) & 0xFF;
+			if (alpha == 0) {
+				continue;
+			}
+
+			const uint32 r = (color >> srcFormat.rShift) & 0xFF;
+			const uint32 g = (color >> srcFormat.gShift) & 0xFF;
+			const uint32 b = (color >> srcFormat.bShift) & 0xFF;
+
+			if (alpha == 0xFF) {
+				destRow[x] = isSameFormat ? color : destFormat.ARGBToColor(0xFF, r, g, b);
+				continue;
+			}
+
+			const uint32 destColor = destRow[x];
+			const uint32 destAlpha = hasDestAlpha ? (destColor >> destFormat.aShift) & 0xFF : 0xFF;
+			uint32 dr = (destColor >> destFormat.rShift) & 0xFF;
+			uint32 dg = (destColor >> destFormat.gShift) & 0xFF;
+			uint32 db = (destColor >> destFormat.bShift) & 0xFF;
+			uint32 da = destAlpha;
+
+			if (destAlpha == 0xFF) {
+				// x * 257 * 257 >> 24 is about x / 255, rounded as ManagedSurface::blitFrom does
+				dr = (((dr * (255U - alpha) + r * alpha) * (257U * 257U)) >> 24) & 0xFF;
+				dg = (((dg * (255U - alpha) + g * alpha) * (257U * 257U)) >> 24) & 0xFF;
+				db = (((db * (255U - alpha) + b * alpha) * (257U * 257U)) >> 24) & 0xFF;
+			} else {
+				const double sAlpha = alpha / 255.0;
+				const double dAlpha = destAlpha / 255.0 * (1.0 - sAlpha);
+				dr = (uint32)((r * sAlpha + dr * dAlpha) / (sAlpha + dAlpha));
+				dg = (uint32)((g * sAlpha + dg * dAlpha) / (sAlpha + dAlpha));
+				db = (uint32)((b * sAlpha + db * dAlpha) / (sAlpha + dAlpha));
+				da = (uint32)(255. * (sAlpha + dAlpha));
+			}
+
+			destRow[x] = destFormat.ARGBToColor(da, dr, dg, db);
+		}
+	}
+
+	target.addDirtyRect(clipped);
+	return true;
+}
+
+// The channels of every pixel get multiplied by those of the color, through
+// tables, with no conversions of the pixel formats. A picture without alpha
+// leaves out its pixels of the color key.
+bool GraphicsManager::copyTinted(Graphics::ManagedSurface &dst, const Common::Point &dstPos, const Graphics::ManagedSurface &src, const Common::Rect &srcRect, uint32 argb, uint32 keyColor) {
+	const Graphics::PixelFormat &inFormat = src.format;
+	const Graphics::PixelFormat &outFormat = dst.format;
+	if (!hasByteChannels(inFormat) || !hasByteChannels(outFormat) || outFormat.aBits() != 8) {
+		return false;
+	}
+
+	byte tableA[256], tableR[256], tableG[256], tableB[256];
+	for (uint i = 0; i < 256; ++i) {
+		tableA[i] = (byte)(i * (argb >> 24) / 255);
+		tableR[i] = (byte)(i * ((argb >> 16) & 0xFF) / 255);
+		tableG[i] = (byte)(i * ((argb >> 8) & 0xFF) / 255);
+		tableB[i] = (byte)(i * (argb & 0xFF) / 255);
+	}
+
+	byte keyR, keyG, keyB;
+	inFormat.colorToRGB(keyColor, keyR, keyG, keyB);
+	const bool hasAlpha = inFormat.aBits() != 0;
+
+	for (int y = 0; y < srcRect.height(); ++y) {
+		uint32 *outRow = (uint32 *)dst.getBasePtr(dstPos.x, dstPos.y + y);
+		const uint32 *inRow = (const uint32 *)src.getBasePtr(srcRect.left, srcRect.top + y);
+
+		for (int x = 0; x < srcRect.width(); ++x) {
+			const uint32 pixel = inRow[x];
+			const byte red = (pixel >> inFormat.rShift) & 0xFF;
+			const byte green = (pixel >> inFormat.gShift) & 0xFF;
+			const byte blue = (pixel >> inFormat.bShift) & 0xFF;
+			byte alpha = 0xFF;
+			if (hasAlpha) {
+				alpha = (pixel >> inFormat.aShift) & 0xFF;
+			} else if (red == keyR && green == keyG && blue == keyB) {
+				continue;
+			}
+
+			outRow[x] = ((uint32)tableA[alpha] << outFormat.aShift) | ((uint32)tableR[red] << outFormat.rShift) |
+				((uint32)tableG[green] << outFormat.gShift) | ((uint32)tableB[blue] << outFormat.bShift);
+		}
+	}
+
+	return true;
+}
+
+// Draw a given screen-space rectangle of an object
+void GraphicsManager::blitObject(Graphics::ManagedSurface &target, const RenderObject &src, Common::Rect screenRect) {
+	// An object whose image is missing has nothing to draw
+	if (src._drawSurface.empty()) {
+		return;
+	}
+
+	if (!src.isZoomed()) {
+		const Common::Rect source = src._drawSurface.getBounds().findIntersectingRect(src.convertToLocal(screenRect));
+		if (!blitAlpha32(target, src._drawSurface, source, screenRect)) {
+			target.blitFrom(src._drawSurface, source, screenRect);
+		}
+
+		return;
+	}
+
+	// A zoomed object gets stretched from where it would be without the zoom
+	const ViewTransform &view = *src.getViewTransform();
+	const Common::Rect viewport = NancySceneState.getViewport().getScreenPosition();
+
+	Common::Rect unzoomed;
+	unzoomed.left = viewport.left + (int)floor((screenRect.left - viewport.left - view.offsetX) / view.scaleX);
+	unzoomed.top = viewport.top + (int)floor((screenRect.top - viewport.top - view.offsetY) / view.scaleY);
+	unzoomed.right = viewport.left + (int)ceil((screenRect.right - viewport.left - view.offsetX) / view.scaleX);
+	unzoomed.bottom = viewport.top + (int)ceil((screenRect.bottom - viewport.top - view.offsetY) / view.scaleY);
+	if (unzoomed.isEmpty()) {
+		return;
+	}
+
+	const Common::Rect source = src._drawSurface.getBounds().findIntersectingRect(src.convertToLocal(unzoomed));
+	if (!source.isEmpty()) {
+		target.blitFrom(src._drawSurface, source, screenRect);
+	}
+}
+
+// Whether a stencil object covers a pixel of the screen: where its picture
+// isn't transparent, as the alpha test of the original lets through. The mask
+// of the flashlight is black where it lights, so its alpha is what counts.
+static bool isStencilPixel(const RenderObject &stencil, int x, int y) {
+	const Common::Rect local = stencil.convertToLocal(Common::Rect(x, y, x + 1, y + 1));
+	const Graphics::ManagedSurface &surface = stencil._drawSurface;
+	if (!surface.getBounds().contains(local.left, local.top)) {
+		return false;
+	}
+
+	const uint32 color = surface.getPixel(local.left, local.top);
+	if (surface.format.aBits() == 0) {
+		return !surface.hasTransparentColor() || color != surface.getTransparentColor();
+	}
+
+	byte a, r, g, b;
+	surface.format.colorToARGB(color, a, r, g, b);
+	return a != 0;
+}
+
+// Draws an object without the pixels the stencils cover, through a transparent
+// copy of the part that gets drawn
+void GraphicsManager::blitMaskedObject(Graphics::ManagedSurface &target, const RenderObject &src, const Common::Array<const RenderObject *> &stencils, const Common::Rect &screenRect) {
+	const Graphics::ManagedSurface &image = src._drawSurface;
+	const Common::Rect source = image.getBounds().findIntersectingRect(src.convertToLocal(screenRect));
+	if (src.isZoomed() || source.isEmpty() || source.width() != screenRect.width() || source.height() != screenRect.height()) {
+		blitObject(target, src, screenRect);
+		return;
+	}
+
+	Graphics::ManagedSurface part(source.width(), source.height(), _transparentPixelFormat);
+	for (int y = 0; y < source.height(); ++y) {
+		for (int x = 0; x < source.width(); ++x) {
+			const uint32 color = image.getPixel(source.left + x, source.top + y);
+			byte a = 0, r = 0, g = 0, b = 0;
+			if (!image.hasTransparentColor() || color != image.getTransparentColor()) {
+				image.format.colorToARGB(color, a, r, g, b);
+			}
+
+			for (uint i = 0; a != 0 && i < stencils.size(); ++i) {
+				if (isStencilPixel(*stencils[i], screenRect.left + x, screenRect.top + y)) {
+					a = 0;
+				}
+			}
+
+			part.setPixel(x, y, _transparentPixelFormat.ARGBToColor(a, r, g, b));
+		}
+	}
+
+	if (!blitAlpha32(target, part, part.getBounds(), screenRect)) {
+		target.blitFrom(part, part.getBounds(), screenRect);
+	}
+}
+
+Common::Rect GraphicsManager::getDrawnPosition(const RenderObject &object) const {
+	const Common::Rect position = object.getScreenPosition();
+	if (!object.isZoomed() || position.isEmpty()) {
+		return position;
+	}
+
+	const ViewTransform &view = *object.getViewTransform();
+	const Common::Rect viewport = NancySceneState.getViewport().getScreenPosition();
+	if (view.scaleX <= 0.0 || view.scaleY <= 0.0) {
+		return Common::Rect();
+	}
+
+	// Scaled around the top left of the viewport, then moved, and kept inside it
+	Common::Rect zoomed;
+	zoomed.left = viewport.left + (int)floor((position.left - viewport.left) * view.scaleX + view.offsetX);
+	zoomed.top = viewport.top + (int)floor((position.top - viewport.top) * view.scaleY + view.offsetY);
+	zoomed.right = viewport.left + (int)ceil((position.right - viewport.left) * view.scaleX + view.offsetX);
+	zoomed.bottom = viewport.top + (int)ceil((position.bottom - viewport.top) * view.scaleY + view.offsetY);
+	zoomed.clip(viewport);
+	return zoomed;
+}
+
+int GraphicsManager::objectComparator(const void *a, const void *b) {
+	if (((const RenderObject*)a)->getZOrder() < ((const RenderObject*)b)->getZOrder()) {
+		return -1;
+	} else if (((const RenderObject*)a)->getZOrder() > ((const RenderObject*)b)->getZOrder()) {
+		return 1;
+	} else if (((const RenderObject*)a)->getTieOrder() < ((const RenderObject*)b)->getTieOrder()) {
+		return -1;
+	} else if (((const RenderObject*)a)->getTieOrder() > ((const RenderObject*)b)->getTieOrder()) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+} // End of namespace Nancy
